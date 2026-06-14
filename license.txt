@@ -1,0 +1,28 @@
+SALIKHA STUDIO PRO - SOFTWARE LICENSE AGREEMENT
+
+Copyright (c) 2026 Salikha. All rights reserved.
+
+IMPORTANT - READ CAREFULLY: This End-User License Agreement ("EULA") is a legal agreement between you and Salikha for the Salikha Studio Pro software product.
+
+By installing or using this software, you agree to be bound by the terms of this EULA.
+
+1. GRANT OF LICENSE
+   Salikha grants you a non-exclusive, non-transferable license to use Salikha Studio Pro software.
+
+2. RESTRICTIONS
+   You are strictly prohibited from:
+   - Redistributing or selling this software
+   - Reverse engineering, decompiling, or disassembling
+   - Modifying or adapting the software
+   - Copying the software except for backup purposes
+
+3. INTELLECTUAL PROPERTY
+   The software and all copies thereof are proprietary to Salikha and title thereto remains in Salikha.
+
+4. TERMINATION
+   This license is effective until terminated. It will terminate automatically without notice if you fail to comply with any term of this agreement.
+
+5. DISCLAIMER OF WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND.
+
+By clicking Next and entering the password, you acknowledge that you have read, understand, and agree to be bound by the terms of this license.

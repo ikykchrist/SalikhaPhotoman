@@ -1,10 +1,12 @@
-import os, time, threading, json, queue, stat, shutil
+import os, time, threading, json, queue, stat, shutil, uuid, subprocess
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, ttk, filedialog
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from PIL import Image, ImageOps, ImageTk, ImageWin, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageTk, ImageWin, ImageFilter, UnidentifiedImageError
 import win32print, win32ui
+from ctypes import windll, c_wchar_p, byref, c_void_p, WinError
 
 # --- PILLOW COMPATIBILITY ---
 try:
@@ -14,6 +16,132 @@ except ImportError:
     RESAMPLE_METHOD = getattr(Image, 'LANCZOS', getattr(Image, 'ANTIALIAS', 1))
 
 CONFIG_FILE = "salikha_layout.json"
+COUNTER_FILE = "salikha_counter.json"
+COPIED_FILES_FILE = "salikha_copied_files.json"
+
+def load_copied_tracking():
+    try:
+        if os.path.exists(COPIED_FILES_FILE):
+            with open(COPIED_FILES_FILE, 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_copied_tracking(data):
+    try:
+        with open(COPIED_FILES_FILE, 'w') as f:
+            json.dump(data, f)
+    except:
+        pass
+
+def is_already_copied(source_path, tracking):
+    entry = tracking.get(source_path)
+    if not entry:
+        return False
+    try:
+        current_size = os.path.getsize(source_path)
+        current_ctime = os.path.getctime(source_path)
+        return entry.get("size") == current_size and entry.get("ctime") == current_ctime
+    except:
+        return False
+
+def get_next_sd_counter():
+    instance_id = str(uuid.uuid4())[:8]
+    
+    try:
+        if os.path.exists(COUNTER_FILE):
+            with open(COUNTER_FILE, 'r') as f:
+                data = json.load(f)
+        else:
+            data = {"sd_counter": 0, "instances": {}}
+    except:
+        data = {"sd_counter": 0, "instances": {}}
+    
+    counter = data.get("sd_counter", 0) + 1
+    data["sd_counter"] = counter
+    data["instances"][instance_id] = counter
+    
+    try:
+        with open(COUNTER_FILE, 'w') as f:
+            json.dump(data, f)
+    except:
+        pass
+    
+    return counter, instance_id
+
+def generate_sd_filename(original_path, dest_folder):
+    camera_name = os.path.splitext(os.path.basename(original_path))[0]
+    counter, _ = get_next_sd_counter()
+    filename = f"{camera_name}_{counter:04d}.jpg"
+    
+    while os.path.exists(os.path.join(dest_folder, filename)):
+        counter += 1
+        filename = f"{camera_name}_{counter:04d}.jpg"
+        
+        try:
+            if os.path.exists(COUNTER_FILE):
+                with open(COUNTER_FILE, 'r') as f:
+                    data = json.load(f)
+            else:
+                data = {"sd_counter": 0, "instances": {}}
+            data["sd_counter"] = counter
+            with open(COUNTER_FILE, 'w') as f:
+                json.dump(data, f)
+        except:
+            pass
+    
+    return filename
+
+class TransferNotification:
+    def __init__(self, parent, count, dest):
+        self.count = count
+        self.dest = dest
+        self.window = tk.Toplevel(parent)
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        
+        screen_w = self.window.winfo_screenwidth()
+        screen_h = self.window.winfo_screenheight()
+        win_w, win_h = 350, 120
+        x = screen_w - win_w - 20
+        y = screen_h - win_h - 60
+        
+        self.window.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        
+        self.canvas = tk.Canvas(self.window, width=win_w, height=win_h, bg="#1a1a2e", highlightthickness=0)
+        self.canvas.pack()
+        
+        self.alpha = 0.0
+        self.fade_dir = 1
+        
+        self.canvas.create_oval(15, 25, 55, 65, fill="#00d4aa", tags="check")
+        self.canvas.create_text(35, 45, text="✓", fill="white", font=("Arial", 24, "bold"), tags="check_sym")
+        
+        self.canvas.create_text(70, 35, text="TRANSFER COMPLETE!", fill="#00d4aa", font=("Arial", 13, "bold"), anchor="w")
+        self.canvas.create_text(70, 58, text=f"{count} files copied", fill="#ffffff", font=("Arial", 10), anchor="w")
+        self.canvas.create_text(70, 78, text=f"→ {os.path.basename(dest)}", fill="#888888", font=("Arial", 9), anchor="w")
+        
+        self.animate()
+        self.window.after(3000, self.fade_out)
+    
+    def animate(self):
+        if self.fade_dir == 1:
+            self.alpha = min(1.0, self.alpha + 0.1)
+            self.window.attributes("-alpha", self.alpha)
+            if self.alpha < 1.0:
+                self.window.after(30, self.animate)
+        else:
+            self.alpha = max(0, self.alpha - 0.1)
+            self.window.attributes("-alpha", self.alpha)
+            if self.alpha > 0:
+                self.window.after(30, self.animate)
+            else:
+                self.window.destroy()
+    
+    def fade_out(self):
+        self.fade_dir = -1
+        self.animate()
 
 class SalikhaStudioPro:
     def __init__(self, root):
@@ -29,7 +157,9 @@ class SalikhaStudioPro:
         self.gui_queue = queue.Queue()
         self.processed_files = set()
         
-        self.boxes = [] 
+        self.boxes = []
+        self.box_items = []
+        self.box_labels = []
         self.template_path = ""
         self.print_count = 0
         self.is_running = False  
@@ -45,9 +175,15 @@ class SalikhaStudioPro:
         self.output_folder = os.path.abspath("./prints_archive")
         
         # Defaults Sorter
-        self.sd_source = ""
+        self.sd_source = "F:\\DCIM"
         self.sd_dest_prot = ""
         self.sd_dest_raw = ""
+        
+        # Sharpen (0-100%)
+        self.sharpen_value = 0
+        
+        # Instance ID for counter
+        self.instance_id = str(uuid.uuid4())[:8]
 
         for f in [self.source_folder, self.output_folder]:
             if not os.path.exists(f): os.makedirs(f)
@@ -114,10 +250,50 @@ class SalikhaStudioPro:
         ratio_frame = tk.LabelFrame(ctrl, text="Box Aspect Ratio", bg="#f8f9fa")
         ratio_frame.pack(fill="x", padx=15, pady=10)
         
-        self.box_ratio = tk.StringVar(value="Landscape (4:3)")
+        self.box_ratio = tk.StringVar(value="Landscape (3:2)")
+        ttk.Radiobutton(ratio_frame, text="Landscape (3:2)", variable=self.box_ratio, value="Landscape (3:2)").pack(anchor="w", padx=10, pady=2)
+        ttk.Radiobutton(ratio_frame, text="Portrait (2:3)", variable=self.box_ratio, value="Portrait (2:3)").pack(anchor="w", padx=10, pady=2)
         ttk.Radiobutton(ratio_frame, text="Landscape (4:3)", variable=self.box_ratio, value="Landscape (4:3)").pack(anchor="w", padx=10, pady=2)
         ttk.Radiobutton(ratio_frame, text="Portrait (3:4)", variable=self.box_ratio, value="Portrait (3:4)").pack(anchor="w", padx=10, pady=2)
         ttk.Radiobutton(ratio_frame, text="Freeform", variable=self.box_ratio, value="Freeform").pack(anchor="w", padx=10, pady=2)
+
+        dup_frame = tk.LabelFrame(ctrl, text="Duplicate Box", bg="#f8f9fa")
+        dup_frame.pack(fill="x", padx=15, pady=10)
+        
+        self.dup_src_var = tk.StringVar(value="1")
+        dup_top = tk.Frame(dup_frame, bg="#f8f9fa")
+        dup_top.pack(fill="x", padx=5, pady=2)
+        tk.Label(dup_top, text="Source:", bg="#f8f9fa").pack(side="left")
+        self.dup_src_combo = ttk.Combobox(dup_top, textvariable=self.dup_src_var, values=[str(i) for i in range(1, 11)], width=5, state="readonly")
+        self.dup_src_combo.pack(side="left", padx=5)
+        tk.Button(dup_frame, text="Duplicate", command=self.duplicate_box, bg="#007bff", fg="white", font=("Arial", 9, "bold")).pack(fill="x", padx=5, pady=2)
+
+        coord_frame = tk.LabelFrame(ctrl, text="Fine-tune Coordinates", bg="#f8f9fa")
+        coord_frame.pack(fill="x", padx=15, pady=10)
+        
+        coord_top = tk.Frame(coord_frame, bg="#f8f9fa")
+        coord_top.pack(fill="x", padx=5, pady=2)
+        tk.Label(coord_top, text="Box#:", bg="#f8f9fa").pack(side="left")
+        self.coord_idx_var = tk.StringVar(value="1")
+        self.coord_idx_combo = ttk.Combobox(coord_top, textvariable=self.coord_idx_var, values=[str(i) for i in range(1, 11)], width=5, state="readonly")
+        self.coord_idx_combo.pack(side="left", padx=5)
+        tk.Button(coord_top, text="Load", command=self.load_box_coords, width=6).pack(side="left", padx=2)
+        
+        coord_grid = tk.Frame(coord_frame, bg="#f8f9fa")
+        coord_grid.pack(fill="x", padx=5, pady=2)
+        tk.Label(coord_grid, text="X1:", bg="#f8f9fa", width=4).grid(row=0, column=0)
+        self.coord_x1 = tk.Entry(coord_grid, width=8)
+        self.coord_x1.grid(row=0, column=1, padx=2)
+        tk.Label(coord_grid, text="Y1:", bg="#f8f9fa", width=4).grid(row=0, column=2)
+        self.coord_y1 = tk.Entry(coord_grid, width=8)
+        self.coord_y1.grid(row=0, column=3, padx=2)
+        tk.Label(coord_grid, text="X2:", bg="#f8f9fa", width=4).grid(row=1, column=0)
+        self.coord_x2 = tk.Entry(coord_grid, width=8)
+        self.coord_x2.grid(row=1, column=1, padx=2)
+        tk.Label(coord_grid, text="Y2:", bg="#f8f9fa", width=4).grid(row=1, column=2)
+        self.coord_y2 = tk.Entry(coord_grid, width=8)
+        self.coord_y2.grid(row=1, column=3, padx=2)
+        tk.Button(coord_frame, text="Apply Changes", command=self.apply_coord_changes, bg="#28a745", fg="white", font=("Arial", 9, "bold")).pack(fill="x", padx=5, pady=2)
 
         tk.Label(ctrl, text="Click & Drag to Draw.\nClick inside a box to Move it.", fg="#555", bg="#f8f9fa", justify="center").pack(pady=5)
         tk.Button(ctrl, text="Clear All Boxes", command=self.clear_boxes, bg="#ff4c4c", fg="white", font=("Arial", 10, "bold")).pack(fill="x", padx=15, pady=(20, 5))
@@ -156,8 +332,10 @@ class SalikhaStudioPro:
             self.canvas.create_rectangle(
                 2, 2, disp.width-2, disp.height-2, 
                 outline="#00ff00", width=3, dash=(5, 5), tags="template_border"
-            )
-            self.boxes = [] 
+)
+            self.boxes = []
+            self.box_items = []
+            self.box_labels = []
 
     def on_press(self, e):
         items = self.canvas.find_withtag("photobox")
@@ -167,7 +345,9 @@ class SalikhaStudioPro:
                 self.selected_item = item
                 self.action = 'move'
                 self.start_x, self.start_y = e.x, e.y
-                self.canvas.itemconfig(item, outline="yellow", width=4) 
+                self.canvas.itemconfig(item, outline="yellow", width=4)
+                idx = self.box_items.index(item) + 1
+                self.coord_idx_var.set(str(idx))
                 return
         
         self.action = 'draw'
@@ -187,10 +367,16 @@ class SalikhaStudioPro:
             
             ratio_mode = self.box_ratio.get()
             
-            if "Landscape" in ratio_mode:
-                h = abs(dx) * 0.75 * (1 if dy > 0 else -1)
+            if ratio_mode == "Landscape (3:2)":
+                h = abs(dx) * (2/3) * (1 if dy > 0 else -1)
                 self.canvas.coords(self.rect, self.sx, self.sy, self.sx + dx, self.sy + h)
-            elif "Portrait" in ratio_mode:
+            elif ratio_mode == "Portrait (2:3)":
+                h = abs(dx) * (3/2) * (1 if dy > 0 else -1)
+                self.canvas.coords(self.rect, self.sx, self.sy, self.sx + dx, self.sy + h)
+            elif ratio_mode == "Landscape (4:3)":
+                h = abs(dx) * (3/4) * (1 if dy > 0 else -1)
+                self.canvas.coords(self.rect, self.sx, self.sy, self.sx + dx, self.sy + h)
+            elif ratio_mode == "Portrait (3:4)":
                 h = abs(dx) * (4/3) * (1 if dy > 0 else -1)
                 self.canvas.coords(self.rect, self.sx, self.sy, self.sx + dx, self.sy + h)
             else:
@@ -198,7 +384,8 @@ class SalikhaStudioPro:
 
     def on_release(self, e):
         if self.action == 'move' and self.selected_item:
-            self.canvas.itemconfig(self.selected_item, outline="#00aaff", width=3) 
+            self.canvas.itemconfig(self.selected_item, outline="#00aaff", width=3)
+            self.load_box_coords()
             
         if self.action == 'draw':
             c = self.canvas.coords(self.rect)
@@ -207,18 +394,83 @@ class SalikhaStudioPro:
                 self.canvas.delete(self.rect)
             else:
                 self.canvas.coords(self.rect, x1, y1, x2, y2)
+                self.box_items.append(self.rect)
+                new_label = len(self.box_labels) + 1
+                self.box_labels.append(new_label)
         
         self.sync_boxes()
 
     def sync_boxes(self):
         self.boxes = []
-        for item in self.canvas.find_withtag("photobox"):
+        for i, item in enumerate(self.box_items):
             c = self.canvas.coords(item)
             self.boxes.append([x * self.scale for x in c])
+        self.relabel_boxes()
+
+    def relabel_boxes(self):
+        self.canvas.delete("boxlabel")
+        for i, item in enumerate(self.box_items):
+            c = self.canvas.coords(item)
+            label_x = c[0] + 15
+            label_y = c[1] + 15
+            label_text = str(self.box_labels[i])
+            self.canvas.create_text(label_x, label_y, text=label_text, fill="yellow", font=("Arial", 12, "bold"), tags=("boxlabel"))
 
     def clear_boxes(self):
         self.canvas.delete("photobox")
-        self.sync_boxes()
+        self.canvas.delete("boxlabel")
+        self.boxes = []
+        self.box_items = []
+        self.box_labels = []
+
+    def duplicate_box(self):
+        try:
+            src_num = int(self.dup_src_var.get()) - 1
+            if src_num < 0 or src_num >= len(self.box_items):
+                messagebox.showwarning("Duplicate", f"Box {src_num + 1} does not exist.")
+                return
+            item = self.box_items[src_num]
+            c = self.canvas.coords(item)
+            x1, y1, x2, y2 = c
+            offset = 20
+            new_rect = self.canvas.create_rectangle(x1 + offset, y1 + offset, x2 + offset, y2 + offset, outline="#00aaff", width=3, tags="photobox")
+            self.box_items.append(new_rect)
+            new_coords = [(x1 + offset) * self.scale, (y1 + offset) * self.scale, (x2 + offset) * self.scale, (y2 + offset) * self.scale]
+            self.boxes.append(new_coords)
+            src_label = self.box_labels[src_num]
+            self.box_labels.append(src_label)
+            self.relabel_boxes()
+        except Exception as e:
+            messagebox.showerror("Duplicate Error", str(e))
+
+    def load_box_coords(self):
+        try:
+            idx = int(self.coord_idx_var.get()) - 1
+            if idx < 0 or idx >= len(self.box_items):
+                return
+            c = self.canvas.coords(self.box_items[idx])
+            self.coord_x1.delete(0, tk.END); self.coord_x1.insert(0, str(int(c[0])))
+            self.coord_y1.delete(0, tk.END); self.coord_y1.insert(0, str(int(c[1])))
+            self.coord_x2.delete(0, tk.END); self.coord_x2.insert(0, str(int(c[2])))
+            self.coord_y2.delete(0, tk.END); self.coord_y2.insert(0, str(int(c[3])))
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+
+    def apply_coord_changes(self):
+        try:
+            idx = int(self.coord_idx_var.get()) - 1
+            if idx < 0 or idx >= len(self.box_items):
+                messagebox.showwarning("Apply", f"Box {idx + 1} does not exist.")
+                return
+            x1 = int(self.coord_x1.get())
+            y1 = int(self.coord_y1.get())
+            x2 = int(self.coord_x2.get())
+            y2 = int(self.coord_y2.get())
+            self.canvas.coords(self.box_items[idx], x1, y1, x2, y2)
+            self.boxes[idx] = [x1 * self.scale, y1 * self.scale, x2 * self.scale, y2 * self.scale]
+            self.relabel_boxes()
+        except Exception as e:
+            messagebox.showerror("Apply Error", str(e))
 
     # ========================================================
     # TAB 2: ENGINE
@@ -235,6 +487,7 @@ class SalikhaStudioPro:
         self.src_entry.insert(0, self.source_folder)
         self.src_entry.pack(side="left", fill="x", expand=True, padx=5)
         ttk.Button(src_frame, text="Browse", command=self.select_source).pack(side="right")
+        ttk.Button(src_frame, text="📂", command=self.open_event_folder, width=3).pack(side="right", padx=2)
 
         out_frame = tk.LabelFrame(left, text="Output (Save Prints)", padx=5, pady=5)
         out_frame.pack(fill="x", pady=5)
@@ -256,6 +509,14 @@ class SalikhaStudioPro:
         
         self.reprint_btn = ttk.Button(print_ctrl_frame, text="🔄 REPRINT LAST", command=self.reprint_last, state="disabled")
         self.reprint_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        sharpen_frame = tk.LabelFrame(left, text="Sharpen (Print Output Only)", padx=5, pady=5)
+        sharpen_frame.pack(fill="x", pady=5)
+        self.sharpen_var = tk.IntVar(value=self.sharpen_value)
+        sharpen_slider = ttk.Scale(sharpen_frame, from_=0, to=100, variable=self.sharpen_var, command=self.on_sharpen_change)
+        sharpen_slider.pack(fill="x", padx=5, pady=2)
+        self.sharpen_lbl = tk.Label(sharpen_frame, text=f"Sharpness: {self.sharpen_value}%", fg="#007bff")
+        self.sharpen_lbl.pack()
 
         self.count_lbl = tk.Label(left, text="Total Prints: 0", font=("Arial", 16, "bold"), fg="#007bff")
         self.count_lbl.pack(pady=10)
@@ -282,6 +543,16 @@ class SalikhaStudioPro:
     def select_output(self):
         path = filedialog.askdirectory()
         if path: self.output_folder = path; self.out_entry.delete(0, tk.END); self.out_entry.insert(0, path)
+
+    def open_event_folder(self):
+        if os.path.exists(self.source_folder):
+            subprocess.Popen(['explorer', self.source_folder])
+        else:
+            messagebox.showwarning("Folder Not Found", "Source folder does not exist.")
+
+    def on_sharpen_change(self, val):
+        self.sharpen_value = int(float(val))
+        self.sharpen_lbl.config(text=f"Sharpness: {self.sharpen_value}%")
 
     def open_printer_preferences(self):
         try:
@@ -352,7 +623,7 @@ class SalikhaStudioPro:
             try:
                 files = [os.path.join(self.source_folder, f) for f in os.listdir(self.source_folder)]
                 files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-                files.sort(key=os.path.getmtime)
+                files.sort(key=os.path.getctime)
                 for f in files:
                     norm_f = os.path.normpath(f)
                     if norm_f not in self.processed_files:
@@ -364,8 +635,12 @@ class SalikhaStudioPro:
 
     def logic_processor_loop(self):
         current_session = [] 
-        required_count = len(self.boxes)
-        self.queue_log(f"ℹ️ Layout requires {required_count} photos.")
+        unique_labels = []
+        for lbl in self.box_labels:
+            if lbl not in unique_labels:
+                unique_labels.append(lbl)
+        required_count = len(unique_labels)
+        self.queue_log(f"ℹ️ Layout requires {required_count} unique photo slots.")
 
         while self.is_running:
             try:
@@ -407,10 +682,17 @@ class SalikhaStudioPro:
             with Image.open(self.template_path) as t:
                 overlay = t.convert("RGBA")
                 canvas = Image.new("RGBA", overlay.size, (255, 255, 255, 255))
-                for i, p in enumerate(current_files):
-                    if i < len(self.boxes):
-                        box = self.boxes[i]
-                        with Image.open(p) as img:
+                
+                unique_labels = []
+                for lbl in self.box_labels:
+                    if lbl not in unique_labels:
+                        unique_labels.append(lbl)
+                label_to_idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
+                
+                for box_idx, (box, label) in enumerate(zip(self.boxes, self.box_labels)):
+                    photo_idx = label_to_idx[label]
+                    if photo_idx < len(current_files):
+                        with Image.open(current_files[photo_idx]) as img:
                             img = ImageOps.exif_transpose(img)
                             w, h = int(box[2]-box[0]), int(box[3]-box[1])
                             img = ImageOps.fit(img, (w, h), RESAMPLE_METHOD)
@@ -422,10 +704,28 @@ class SalikhaStudioPro:
                 self.gui_queue.put({"action": "preview", "image": prev})
 
                 if save_to_disk:
+                    if not os.path.exists(self.output_folder):
+                        try:
+                            os.makedirs(self.output_folder, exist_ok=True)
+                        except Exception as e:
+                            self.queue_log(f"❌ Cannot create output folder: {self.output_folder}")
+                            return
                     filename = f"Print_{int(time.time())}.jpg"
                     out_path = os.path.join(self.output_folder, filename)
-                    canvas.convert("RGB").save(out_path, "JPEG", quality=98)
-                    self.queue_log(f"💾 SAVED: {filename}")
+                    
+                    save_img = canvas.convert("RGB")
+                    
+                    if self.sharpen_value > 0:
+                        radius = self.sharpen_value / 10.0
+                        percent = self.sharpen_value * 2
+                        save_img = save_img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent))
+                    
+                    try:
+                        save_img.save(out_path, "JPEG", quality=98)
+                        self.queue_log(f"💾 SAVED: {filename}")
+                    except PermissionError:
+                        self.queue_log(f"❌ Permission denied saving {filename} - file may be open elsewhere")
+                        return
 
                     self.last_printed_file = out_path
                     self.gui_queue.put({"action": "enable_reprint"})
@@ -435,7 +735,7 @@ class SalikhaStudioPro:
                         self.print_count += 1
                         self.gui_queue.put({"action": "update_count", "count": self.print_count})
         except Exception as e:
-            self.queue_log(f"Render Error: {e}")
+            self.queue_log(f"Render Error: {e} | Path: {self.output_folder}")
 
     def silent_print(self, file_path):
         threading.Thread(target=self._print_worker, args=(file_path,)).start()
@@ -465,13 +765,13 @@ class SalikhaStudioPro:
         self.src_path_var = tk.StringVar(value=self.sd_source or "Click to select SD Card...")
         tk.Button(container, textvariable=self.src_path_var, command=self.select_sorter_source, width=80, relief="groove", bg="#fff").pack(pady=2)
 
-        # Step 2: Locked Destination (Restored)
-        ttk.Label(container, text="Step 2: Folder for LOCKED Files (Favorites/Protected)", font=("Arial", 11, "bold")).pack(pady=(15, 2))
+        # Step 2: Locked Destination
+        ttk.Label(container, text="Step 2: Folder for LOCKED Files (L/P separated)", font=("Arial", 11, "bold")).pack(pady=(15, 2))
         self.dest_prot_var = tk.StringVar(value=self.sd_dest_prot or "Click to select destination...")
         tk.Button(container, textvariable=self.dest_prot_var, command=self.select_sorter_dest_prot, width=80, relief="groove", bg="#fff").pack(pady=2)
 
-        # Step 3: Raw/Unlocked Destination
-        ttk.Label(container, text="Step 3: Folder for UNLOCKED Files (Discard/Raw Archive)", font=("Arial", 11, "bold")).pack(pady=(15, 2))
+        # Step 3: Raw Destination (Merged)
+        ttk.Label(container, text="Step 3: Folder for RAW Archive (all photos merged)", font=("Arial", 11, "bold")).pack(pady=(15, 2))
         self.dest_raw_var = tk.StringVar(value=self.sd_dest_raw or "Click to select destination...")
         tk.Button(container, textvariable=self.dest_raw_var, command=self.select_sorter_dest_raw, width=80, relief="groove", bg="#fff").pack(pady=2)
 
@@ -514,9 +814,9 @@ class SalikhaStudioPro:
                 else:
                     return "Portrait"
         except (UnidentifiedImageError, OSError):
-            return "Unsorted"
+            return "Raw"
         except Exception:
-            return "Unsorted"
+            return "Raw"
 
     def toggle_sorter(self):
         if not self.is_sorting:
@@ -537,51 +837,135 @@ class SalikhaStudioPro:
         src = self.src_path_var.get()
         dest_prot = self.dest_prot_var.get()
         dest_raw = self.dest_raw_var.get()
-        valid_exts = ('.JPG', '.JPEG', '.PNG', '.CR2', '.CR3', '.NEF', '.ARW', '.MP4', '.MOV')
-
+        valid_exts = ('.JPG', '.JPEG')
+        tracking = load_copied_tracking()
+        
         while self.is_sorting:
             try:
-                files = [f for f in os.listdir(src) if not f.startswith('.')]
-                
-                for filename in files:
-                    if not self.is_sorting: break
-                    
-                    if filename.upper().endswith(valid_exts):
-                        source_path = os.path.join(src, filename)
+                all_files = []
+                for root, dirs, files in os.walk(src):
+                    if not self.is_sorting:
+                        break
+                    for filename in files:
+                        if not self.is_sorting:
+                            break
+                        if filename.startswith('.'):
+                            continue
                         
-                        if self.is_locked(source_path):
-                            base_folder = dest_prot
-                            lock_status = "LOCKED"
-                        else:
-                            base_folder = dest_raw
-                            lock_status = "RAW"
-
-                        if filename.upper().endswith(('.MP4', '.MOV')):
-                            orient_folder = "Video"
-                        else:
-                            orient_folder = self.get_orientation_folder(source_path)
-
-                        final_dest_folder = os.path.join(base_folder, orient_folder)
-                        if not os.path.exists(final_dest_folder):
-                            os.makedirs(final_dest_folder)
-
-                        target_path = os.path.join(final_dest_folder, filename)
-
-                        if not os.path.exists(target_path):
+                        if filename.upper().endswith(valid_exts):
+                            source_path = os.path.join(root, filename)
+                            if is_already_copied(source_path, tracking):
+                                continue
                             try:
-                                shutil.copy2(source_path, target_path)
-                                os.chmod(target_path, stat.S_IWRITE) 
-                                self.sorter_queue_log(f"[{lock_status} | {orient_folder}] Copied {filename}")
-                            except Exception as e:
-                                self.sorter_queue_log(f"Error copying {filename}: {e}")
-                        
+                                file_ctime = os.path.getctime(source_path)
+                                file_size = os.path.getsize(source_path)
+                            except:
+                                file_ctime = 0
+                                file_size = 0
+                            is_locked = self.is_locked(source_path)
+                            all_files.append((source_path, filename, file_ctime, file_size, is_locked))
+                
+                if not self.is_sorting:
+                    break
+                
+                if not all_files:
+                    self.sorter_queue_log("No new files, waiting...")
+                    time.sleep(2)
+                    continue
+                
+                all_files.sort(key=lambda x: x[2])
+                
+                copy_tasks = []
+                for source_path, filename, file_ctime, file_size, is_locked in all_files:
+                    orient = self.get_orientation_folder(source_path)
+                    copy_tasks.append({
+                        'source': source_path,
+                        'original_filename': filename,
+                        'file_ctime': file_ctime,
+                        'file_size': file_size,
+                        'is_locked': is_locked,
+                        'orient': orient,
+                        'dest_prot': dest_prot,
+                        'dest_raw': dest_raw,
+                        'tracking': tracking
+                    })
+                
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = []
+                    for task in copy_tasks:
+                        future = executor.submit(self._copy_task, task)
+                        futures.append((future, task))
+                    
+                    copied_count = 0
+                    for future, task in futures:
+                        if not self.is_sorting:
+                            break
+                        try:
+                            result = future.result()
+                            if result:
+                                copied_count += 1
+                                self.sorter_queue_log(result)
+                                source = task['source']
+                                tracking[source] = {
+                                    "size": task['file_size'],
+                                    "ctime": task['file_ctime'],
+                                    "copied_at": time.strftime("%Y-%m-%dT%H:%M:%S")
+                                }
+                                save_copied_tracking(tracking)
+                        except Exception as e:
+                            self.sorter_queue_log(f"Error copying {task['original_filename']}: {e}")
+                
+                if copied_count > 0:
+                    self.sorter_queue_log(f"Transfer complete! {copied_count} files copied.")
+                    self.root.after(100, lambda: TransferNotification(self.root, copied_count, dest_raw))
+                
                 time.sleep(2)
-            except Exception as e:
-                self.sorter_queue_log(f"System Error: {e}")
+                
+            except (OSError, PermissionError) as e:
+                self.sorter_queue_log(f"Source folder inaccessible, waiting...")
                 time.sleep(2)
-
+                continue
+        
         self.btn_start_sorter.config(text="START MONITORING & COPYING", bg="#007bff", state="normal")
         self.sorter_queue_log("Monitoring Stopped.")
+
+    def _copy_readonly_file(self, source, dest):
+        try:
+            result = subprocess.run(
+                ['cmd', '/c', 'copy', '/Y', '/V', source, dest],
+                capture_output=True, text=True
+            )
+            return result.returncode == 0
+        except Exception as e:
+            return False
+
+    def _copy_task(self, task):
+        source = task['source']
+        original_filename = task['original_filename']
+        is_locked = task['is_locked']
+        orient = task['orient']
+        dest_prot = task['dest_prot']
+        dest_raw = task['dest_raw']
+        
+        if not os.path.exists(dest_raw):
+            os.makedirs(dest_raw, exist_ok=True)
+        
+        new_filename = generate_sd_filename(source, dest_raw)
+        target_path_raw = os.path.join(dest_raw, new_filename)
+        
+        if not os.path.exists(target_path_raw):
+            self._copy_readonly_file(source, target_path_raw)
+        
+        if is_locked:
+            prot_folder = os.path.join(dest_prot, orient)
+            if not os.path.exists(prot_folder):
+                os.makedirs(prot_folder, exist_ok=True)
+            target_path_prot = os.path.join(prot_folder, new_filename)
+            if not os.path.exists(target_path_prot):
+                self._copy_readonly_file(target_path_raw, target_path_prot)
+            return f"[LOCKED | {orient}] {original_filename} → {new_filename}"
+        else:
+            return f"[RAW] {original_filename} → {new_filename}"
 
     # ========================================================
     # DATA SAVING / LOADING
@@ -590,11 +974,13 @@ class SalikhaStudioPro:
         data = {
             "template": self.template_path, 
             "boxes": self.boxes, 
+            "box_labels": self.box_labels,
             "source": self.source_folder, 
             "output": self.output_folder,
             "sd_source": self.src_path_var.get() if hasattr(self, 'src_path_var') and os.path.isdir(self.src_path_var.get()) else "",
             "sd_dest_prot": self.dest_prot_var.get() if hasattr(self, 'dest_prot_var') and os.path.isdir(self.dest_prot_var.get()) else "",
-            "sd_dest_raw": self.dest_raw_var.get() if hasattr(self, 'dest_raw_var') and os.path.isdir(self.dest_raw_var.get()) else ""
+            "sd_dest_raw": self.dest_raw_var.get() if hasattr(self, 'dest_raw_var') and os.path.isdir(self.dest_raw_var.get()) else "",
+            "sharpen_value": self.sharpen_value
         }
         with open(CONFIG_FILE, "w") as f: json.dump(data, f)
         messagebox.showinfo("Salikha", "Settings and Layout successfully saved!")
@@ -620,17 +1006,36 @@ class SalikhaStudioPro:
                     )
                 
                 self.boxes = data.get("boxes", [])
+                self.box_labels = data.get("box_labels", [])
+                self.box_items = []
                 for box in self.boxes:
                     scaled_box = [x / self.scale for x in box]
-                    self.canvas.create_rectangle(*scaled_box, outline="#00aaff", width=3, tags="photobox")
+                    item = self.canvas.create_rectangle(*scaled_box, outline="#00aaff", width=3, tags="photobox")
+                    self.box_items.append(item)
+                if len(self.box_labels) < len(self.box_items):
+                    self.box_labels = [i + 1 for i in range(len(self.box_items))]
+                self.relabel_boxes()
 
                 src = data.get("source"); out = data.get("output")
-                if src and os.path.exists(src): self.source_folder = src; self.src_entry.delete(0, tk.END); self.src_entry.insert(0, src)
-                if out and os.path.exists(out): self.output_folder = out; self.out_entry.delete(0, tk.END); self.out_entry.insert(0, out)
+                if src:
+                    self.source_folder = src
+                    self.src_entry.delete(0, tk.END); self.src_entry.insert(0, src)
+                    if not os.path.exists(src): os.makedirs(src, exist_ok=True)
+                if out:
+                    self.output_folder = out
+                    self.out_entry.delete(0, tk.END); self.out_entry.insert(0, out)
+                    if not os.path.exists(out): os.makedirs(out, exist_ok=True)
 
                 if data.get("sd_source") and hasattr(self, 'src_path_var'): self.src_path_var.set(data["sd_source"])
                 if data.get("sd_dest_prot") and hasattr(self, 'dest_prot_var'): self.dest_prot_var.set(data["sd_dest_prot"])
                 if data.get("sd_dest_raw") and hasattr(self, 'dest_raw_var'): self.dest_raw_var.set(data["sd_dest_raw"])
+
+                if data.get("sharpen_value") is not None:
+                    self.sharpen_value = data.get("sharpen_value", 0)
+                    if hasattr(self, 'sharpen_var'):
+                        self.sharpen_var.set(self.sharpen_value)
+                    if hasattr(self, 'sharpen_lbl'):
+                        self.sharpen_lbl.config(text=f"Sharpness: {self.sharpen_value}%")
 
             except Exception as e:
                 print(f"Error loading config: {e}")

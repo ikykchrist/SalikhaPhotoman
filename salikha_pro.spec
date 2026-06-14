@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+block_cipher = None
 
 a = Analysis(
     ['salikha_pro.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        'PIL', 'PIL.Image', 'PIL.ImageOps', 'PIL.ImageTk', 'PIL.ImageWin', 'PIL.UnidentifiedImageError',
+        'watchdog', 'watchdog.observers', 'watchdog.events',
+        'win32print', 'win32ui', 'win32api', 'win32con', 'win32com',
+        'queue', 'threading', 'json', 'stat', 'shutil',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,4 +41,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='Salikha Photoman Ico.ico',
 )
