@@ -156,6 +156,7 @@ class SalikhaStudioPro:
         self.input_queue = queue.Queue() 
         self.gui_queue = queue.Queue()
         self.processed_files = set()
+        self.queue_lock = threading.Lock()
         
         self.boxes = []
         self.box_items = []
@@ -609,14 +610,15 @@ class SalikhaStudioPro:
 
     def queue_file(self, file_path):
         norm_path = os.path.normpath(file_path)
-        if norm_path not in self.processed_files:
-            try:
-                mtime = os.path.getmtime(norm_path)
-                if mtime >= self.engine_start_time:
-                    self.processed_files.add(norm_path)
-                    self.input_queue.put(norm_path)
-            except OSError:
-                pass
+        with self.queue_lock:
+            if norm_path not in self.processed_files:
+                try:
+                    mtime = os.path.getmtime(norm_path)
+                    if mtime >= self.engine_start_time:
+                        self.processed_files.add(norm_path)
+                        self.input_queue.put(norm_path)
+                except OSError:
+                    pass
 
     def safety_net_loop(self):
         while self.is_running:
